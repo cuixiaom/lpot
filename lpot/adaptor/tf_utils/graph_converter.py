@@ -62,7 +62,7 @@ from lpot.adaptor.tf_utils.graph_rewriter.generic.insert_print_node import Inser
 from lpot.adaptor.tf_utils.graph_rewriter.graph_util import GraphRewriterHelper as Helper
 
 
-TF_SUPPORTED_MAX_VERSION = '2.6.0'
+TF_SUPPORTED_MAX_VERSION = '2.8.0'
 TF_SUPPORTED_MIN_VERSION = '1.14.0'
 
 logger = logging.getLogger()
@@ -566,6 +566,9 @@ class GraphConverter:
                         self.model.graph_def.library)
 
                     return self._itex_model
+
+                for i in self._calibration_data:
+                    print(i)
 
                 if len(self._calibration_data) > 0:
                     self._freeze_requantization_ranges(self._kl_op_dict)

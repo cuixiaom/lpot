@@ -184,6 +184,7 @@ class Objective(object):
 
         base_acc, _ = baseline
         
+        print("baseline =", baseline, last, self.relative)
         if self.relative:
             acc_target = base_acc * (1 - float(self.acc_goal)) if self.higher_is_better \
                 else base_acc * (1 + float(self.acc_goal))

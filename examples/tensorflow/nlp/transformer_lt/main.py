@@ -149,7 +149,7 @@ def eval_func(infer_graph, iteration=-1):
     bleu_eval = bleu()
     predictions = []
     labels = []
-    warmup = 10
+    warmup = 1
     if iteration != -1:
         assert iteration >= warmup, 'iteration must be larger than warmup'
     for idx, (input_data, label) in enumerate(dataloader):
@@ -234,6 +234,7 @@ def main(_):
         quantizer.eval_func = eval_func
         q_model = quantizer()
         try:
+            print("Trying to save the quantized model")
             q_model.save(FLAGS.output_model)
         except Exception as e:
             print("Failed to save model due to {}".format(str(e)))

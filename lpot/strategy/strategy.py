@@ -572,7 +572,8 @@ class TuneStrategy(object):
                 d.update(kwargs)
                 tuning_history['history'].append(d)
                 tuning_history['last_tune_result'] = self.last_tune_result
-                tuning_history['best_tune_result'] = self.best_tune_result
+                #tuning_history['best_tune_result'] = self.best_tune_result
+                tuning_history['best_tune_result'] = self.last_tune_result
                 tuning_history['cfg'] = self.cfg
                 found = True
                 break
@@ -583,7 +584,8 @@ class TuneStrategy(object):
             tuning_history['cfg']     = self.cfg
             tuning_history['baseline'] = self.baseline
             tuning_history['last_tune_result'] = self.last_tune_result
-            tuning_history['best_tune_result'] = self.best_tune_result
+            #tuning_history['best_tune_result'] = self.best_tune_result
+            tuning_history['best_tune_result'] = self.last_tune_result
             tuning_history['history']  = []
             if tune_cfg and tune_result:
                 d.update(kwargs)

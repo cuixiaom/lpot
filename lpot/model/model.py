@@ -723,6 +723,7 @@ class TensorflowBaseModel(BaseModel):
 class TensorflowSavedModelModel(TensorflowBaseModel):
 
     def save(self, root=None):
+        print("save tensorflow model")
         if not root:
             root = cfg.default_workspace
         root = os.path.abspath(os.path.expanduser(root))

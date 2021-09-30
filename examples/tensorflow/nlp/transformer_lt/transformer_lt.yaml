@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+version: 1.0
+
 model:
   name: transformer_lt
   framework: tensorflow
@@ -31,5 +33,6 @@ tuning:
     relative: 0.01
   exit_policy:
     timeout: 0
-    max_trials: 100
+    max_trials: 1
+    performance_only: True
   random_seed: 9527
