@@ -28,7 +28,6 @@ from ..utils import logger
 from ..conf.dotdict import deep_get
 tensorflow = LazyImport('tensorflow')
 
-
 @adaptor_registry
 class TensorFlowAdaptor(Adaptor):
     unify_op_type_mapping = {
@@ -46,10 +45,10 @@ class TensorFlowAdaptor(Adaptor):
 
         self.quantize_config = {'op_wise_config': {}}
         self.framework_specific_info = framework_specific_info
+        self.approach = deep_get(self.framework_specific_info, 'approach', False)
         self.device = self.framework_specific_info['device']
         self.work_dir = os.path.abspath(self.framework_specific_info['workspace_path'])
         self.recipes = deep_get(self.framework_specific_info, 'recipes', {})
-        self.optimization = deep_get(self.framework_specific_info, 'optimization', {})
         os.makedirs(self.work_dir, exist_ok=True)
 
         self.pre_optimized_model = None
@@ -58,8 +57,10 @@ class TensorFlowAdaptor(Adaptor):
         self.bf16_ops = []
         self.fp32_ops = []
         self.dump_times = 0   # for tensorboard
+
+        cfg_yaml_name = "{}.yaml".format(self.__class__.__name__[:-len('Adaptor')].lower())
         self.query_handler = TensorflowQuery(local_config_file=os.path.join(
-            os.path.dirname(__file__), "tensorflow.yaml"))
+            os.path.dirname(__file__), cfg_yaml_name))
         self.op_wise_sequences = self.query_handler.get_eightbit_patterns()
         self.optimization = self.query_handler.get_grappler_optimization_cfg()
 
@@ -93,6 +94,9 @@ class TensorFlowAdaptor(Adaptor):
         summary = tf.compat.v1.Summary(value=[tf.compat.v1.Summary.Value(tag=tag, histo=hist)])
         writer.add_summary(summary, step)
         writer.flush()
+
+    def train(self, model, dataloader, optimizer_tuple, criterion_tuple, hooks, **kwargs):
+        pass
 
     def evaluate(self, model, dataloader, postprocess=None,
                  metric=None, measurer=None, iteration=-1,
@@ -190,7 +194,7 @@ class TensorFlowAdaptor(Adaptor):
         input_tensor = model.input_tensor
         output_tensor = model.output_tensor if len(model.output_tensor)>1 else \
                             model.output_tensor[0]
-        logger.info("Start to evaluate Tensorflow model...")
+        logger.info("Start to evaluate the TensorFlow model.")
         for idx, (inputs, labels) in enumerate(dataloader):
             # dataloader should keep the order and len of inputs same with input_tensor
             if len(input_tensor) == 1:
@@ -323,18 +327,30 @@ class TensorFlowAdaptor(Adaptor):
         Returns:
             tf.compat.v1.GraphDef: the quantized model
         """
+        if self.approach == "quant_aware_training":
+            assert q_func is not None, "quantization aware training mode \
+                is not configured correctly"
+
+            from lpot.experimental import common
+            qat_model = q_func(model)
+
+            return self.convert(common.Model(qat_model), 'QAT', 'default')
+
         assert q_func is None, "quantization aware training mode is not support on tensorflow"
         self.tuning_cfg_to_fw(tune_cfg)
-        logger.debug('Dump quantization configurations:')
+        logger.debug("Dump quantization configurations:")
         logger.debug(self.quantize_config)
         from .tf_utils.graph_converter import GraphConverter
         converted_model = GraphConverter(model,
-                                   qt_config=self.quantize_config,
-                                   recipes=self.recipes,
-                                   int8_sequences=self.op_wise_sequences,
-                                   fp32_ops=self.fp32_ops,
-                                   bf16_ops=self.bf16_ops,
-                                   data_loader=data_loader).convert()
+                                qt_config=self.quantize_config,
+                                recipes=self.recipes,
+                                int8_sequences=self.op_wise_sequences,
+                                fp32_ops=self.fp32_ops,
+                                bf16_ops=self.bf16_ops,
+                                data_loader=data_loader).convert()
+        #just save framework_specific_info feature for recover
+        converted_model.q_config.update({'framework_specific_info': \
+                                            self.framework_specific_info})
 
         self._dump_model_op_stastics(converted_model.graph_def)
 
@@ -374,7 +390,10 @@ class TensorFlowAdaptor(Adaptor):
                 elif i.attr['T'].type in (dtypes.quint8,dtypes.qint8):
                     res[i.op]['INT8'] += 1
                 elif i.op == 'Cast':
-                    res[i.op]['BF16'] += 1
+                    if i.attr['DstT'].type == dtypes.bfloat16:
+                        res[i.op]['BF16'] += 1
+                    elif i.attr['DstT'].type == dtypes.float32:
+                        res[i.op]['FP32'] += 1
                 else:
                     res[i.op]['FP32'] += 1
         output_data = [[op_type, sum(res[op_type].values()), res[op_type]['INT8'],
@@ -501,7 +520,7 @@ class TensorFlowAdaptor(Adaptor):
             'optypewise': self.get_optype_wise_ability(),
         }
         capability['opwise'] = copy.deepcopy(self.quantizable_op_details)
-        logger.debug('Dump framework quantization capability:')
+        logger.debug("Dump framework quantization capability:")
         logger.debug(capability)
 
         return capability
@@ -621,7 +640,7 @@ class TensorFlowAdaptor(Adaptor):
         Returns:
             [dict]: the key is op_name while the value is the ndarray tensor.
         """
-        logger.info("Start to run inspect_tensor..")
+        logger.info("Start to inspect tensor.")
         from .tf_utils.graph_converter import GraphConverter
         converter = GraphConverter(model,
                                    qt_config=self.quantize_config,
@@ -661,7 +680,7 @@ class TensorFlowAdaptor(Adaptor):
         # quantize input only support tensorflow version > 2.1.0
         import tensorflow as tf
         if tf.version.VERSION < '2.1.0':
-            logger.warning('quantize input need tensorflow version > 2.1.0')
+            logger.warning("Quantize input needs tensorflow 2.1.0 and newer.")
             return model, scale
 
         graph_def = model.as_graph_def()
@@ -796,7 +815,64 @@ class TensorFlowAdaptor(Adaptor):
 
         return converter.convert()
 
+    @dump_elapsed_time("Pass recover model")
+    def recover_tuned_model(self, model, q_config):
+        """Execute the recover process on the specified model.
 
+            Args:
+                tune_cfg (dict): quantization configuration
+                model (tf.compat.v1.GraphDef): fp32 model
+                q_config (dict): recover configuration
+
+            Returns:
+                tf.compat.v1.GraphDef: the quantized model
+        """
+        from .tf_utils.graph_rewriter.generic.pre_optimize import PreOptimization
+        self.pre_optimizer_handle = PreOptimization(model, self.optimization)
+        self.pre_optimized_model = self.pre_optimizer_handle.get_optimized_model()
+        model.graph_def = self.pre_optimized_model.graph_def
+
+        from .tf_utils.graph_converter_without_calib import GraphConverterWithoutCalib
+        converter = GraphConverterWithoutCalib(model,
+                                            recover_config=q_config)
+
+        return converter.convert_without_calib()
+@adaptor_registry
+class Tensorflow_ITEXAdaptor(TensorFlowAdaptor):
+    def __init__(self, framework_specific_info):
+        super().__init__(framework_specific_info)
+
+    @dump_elapsed_time("Pass quantize model")
+    def quantize(self, tune_cfg, model, data_loader, q_func=None):
+        """Execute the quantize process on the specified model.
+
+        Args:
+            tune_cfg (dict): quantization configuration
+            model (tf.compat.v1.GraphDef): fp32 model
+            data_loader (generator): generator the data and labels
+            q_func (optional): training function for quantization aware training mode,
+                                which not enabled for tensorflow yet.
+
+        Returns:
+            tf.compat.v1.GraphDef: the quantized model
+        """
+        assert q_func is None, "quantization aware training mode is not support on tensorflow"
+        self.tuning_cfg_to_fw(tune_cfg)
+        logger.debug('Dump quantization configurations:')
+        logger.debug(self.quantize_config)
+        from .tf_utils.graph_converter import GraphConverter
+        converted_model = GraphConverter(model,
+                                   qt_config=self.quantize_config,
+                                   recipes=self.recipes,
+                                   int8_sequences=self.op_wise_sequences,
+                                   fp32_ops=self.fp32_ops,
+                                   bf16_ops=self.bf16_ops,
+                                   data_loader=data_loader,
+                                   itex_mode=True).convert()
+
+        self._dump_model_op_stastics(converted_model.graph_def)
+
+        return converted_model
 @singleton
 class TensorflowQuery(QueryBackendCapability):
 
@@ -822,10 +898,10 @@ class TensorflowQuery(QueryBackendCapability):
         """
         default_config = None
         for sub_data in data:
-            if sub_data['version']['name'] == self.version:
+            if self.version in sub_data['version']['name']:
                 return sub_data
 
-            if sub_data['version']['name'] == 'default':
+            if 'default' in sub_data['version']['name']:
                 default_config = sub_data
 
         return default_config
@@ -836,9 +912,10 @@ class TensorflowQuery(QueryBackendCapability):
             try:
                 self.cur_config = self._get_specified_version_cfg(content)
             except Exception as e:
-                self.logger.info("Failed to parse {} due to {}".format(self.cfg, str(e)))
+                logger.info("Fail to parse {} due to {}.".format(self.cfg, str(e)))
                 self.cur_config = None
-                raise ValueError("Please check the {} format.".format(self.cfg))
+                raise ValueError("Please check if the format of {} follows LPOT yaml schema.".
+                                 format(self.cfg))
 
     def get_version(self):
         """Get the current backend version infomation.

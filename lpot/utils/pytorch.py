@@ -29,7 +29,43 @@ import copy
 yaml.SafeLoader.add_constructor('tag:yaml.org,2002:python/tuple',
                                  lambda loader, node: tuple(loader.construct_sequence(node)))
 
-def load(checkpoint_dir, model, **kwargs):
+
+def set_activation_scale_zeropoint(q_model, tune_cfg):
+    """set activation scale and zero_point for converted model.
+
+    Args:
+        q_model (dir): Int8 model converted from fp32 model. 
+                       scale=1, zero_point=0 for each module
+        tune_cfg (object): This file provides scale and zero_point of \
+                           output activation of each quantized module.
+
+    Returns:
+        (object): quantized model with scale and zero_point
+    """
+    # pylint: disable=not-callable
+    # tune_ops splits tune_cfg['op'].keys() into {op_name: op_type}
+    if tune_cfg['approach'] == "post_training_dynamic_quant":
+        return
+    tune_ops = dict()
+    for key in tune_cfg['op']:
+        tune_ops[key[0]] = key[1]
+    for name, module in q_model.named_modules():
+        if name in tune_ops.keys():
+            key = (name, tune_ops[name])
+            value = tune_cfg['op'][key]
+            assert isinstance(value, dict)
+            if 'scale' in value['activation'].keys():
+                module.scale = torch.tensor(value['activation']['scale'])
+            if 'zero_point' in value['activation'].keys():
+                module.zero_point = torch.tensor(value['activation']['zero_point'])
+
+    if tune_cfg['framework'] == "pytorch_fx":
+        # get scale and zero_point of getattr ops.
+        for node_target in tune_cfg['get_attr'].keys():
+            setattr(q_model, node_target, torch.tensor(tune_cfg['get_attr'][node_target]))
+
+
+def load(checkpoint_dir=None, model=None, history_cfg=None, **kwargs):
     """Execute the quantize process on the specified model.
 
     Args:
@@ -42,47 +78,49 @@ def load(checkpoint_dir, model, **kwargs):
     Returns:
         (object): quantized model
     """
-
-    tune_cfg_file = os.path.join(os.path.abspath(os.path.expanduser(checkpoint_dir)),
-                                 'best_configure.yaml')
-    weights_file = os.path.join(os.path.abspath(os.path.expanduser(checkpoint_dir)),
-                                'best_model_weights.pt')
-    assert os.path.exists(
-        tune_cfg_file), "tune configure file %s didn't exist" % tune_cfg_file
-    assert os.path.exists(
-        weights_file), "weight file %s didn't exist" % weights_file
-
-    with open(tune_cfg_file, 'r') as f:
-        tune_cfg = yaml.safe_load(f)
+    if checkpoint_dir is not None:
+        tune_cfg_file = os.path.join(os.path.abspath(os.path.expanduser(checkpoint_dir)),
+                                    'best_configure.yaml')
+        weights_file = os.path.join(os.path.abspath(os.path.expanduser(checkpoint_dir)),
+                                    'best_model_weights.pt')
+        assert os.path.exists(
+            tune_cfg_file), "tune configure file %s didn't exist" % tune_cfg_file
+        assert os.path.exists(
+            weights_file), "weight file %s didn't exist" % weights_file
+        with open(tune_cfg_file, 'r') as f:
+            tune_cfg = yaml.safe_load(f)
+    else:
+        assert history_cfg is not None, "Need chieckpoint_dir or history_cfg to rebuild int8 model"
+        tune_cfg = history_cfg
 
     version = get_torch_version()
     if tune_cfg['approach'] != "post_training_dynamic_quant":
-        if version < PT17_VERSION:
+        if version < PT17_VERSION:                                      # pragma: no cover
             q_mapping = tq.default_mappings.DEFAULT_MODULE_MAPPING
-        elif version < PT18_VERSION:
+        elif version < PT18_VERSION:                                    # pragma: no cover
             q_mapping = \
                 tq.quantization_mappings.get_static_quant_module_mappings()
         else:
             q_mapping = \
                 tq.quantization_mappings.get_default_static_quant_module_mappings()
     else:
-        if version < PT17_VERSION:
+        if version < PT17_VERSION:                                      # pragma: no cover
             q_mapping = \
                 tq.default_mappings.DEFAULT_DYNAMIC_MODULE_MAPPING
-        elif version < PT18_VERSION:
+        elif version < PT18_VERSION:                                    # pragma: no cover
             q_mapping = \
                 tq.quantization_mappings.get_dynamic_quant_module_mappings()
         else:
             q_mapping = \
                 tq.quantization_mappings.get_default_dynamic_quant_module_mappings()
 
-    if version < PT17_VERSION:
+    if version < PT17_VERSION:                                          # pragma: no cover
         white_list = \
             tq.default_mappings.DEFAULT_DYNAMIC_MODULE_MAPPING \
             if tune_cfg['approach'] == 'post_training_dynamic_quant' else \
             tq.default_mappings.DEFAULT_QCONFIG_PROPAGATE_WHITE_LIST - \
             {torch.nn.LayerNorm, torch.nn.InstanceNorm3d, torch.nn.Embedding}
-    elif version < PT18_VERSION:
+    elif version < PT18_VERSION:                                       # pragma: no cover
         white_list = \
             tq.quantization_mappings.get_dynamic_quant_module_mappings() \
             if tune_cfg['approach'] == 'post_training_dynamic_quant' else \
@@ -103,8 +141,9 @@ def load(checkpoint_dir, model, **kwargs):
     model.eval()
     try:
         q_model = copy.deepcopy(model)
-    except Exception as e:
-        logger.warning("Deepcopy failed: {}, inplace=True now!".format(repr(e)))
+    except Exception as e:                                           # pragma: no cover
+        logger.warning("Fail to deep copy the model due to {}, inplace is used now.".
+                       format(repr(e)))
         q_model = model
 
     if tune_cfg['framework'] == "pytorch_fx":             # pragma: no cover
@@ -125,8 +164,11 @@ def load(checkpoint_dir, model, **kwargs):
         q_model = convert_fx(q_model,
           convert_custom_config_dict=kwargs['convert_custom_config_dict']
           if kwargs and kwargs.__contains__('convert_custom_config_dict') else None)
-        weights = torch.load(weights_file)
-        q_model.load_state_dict(weights)
+        if checkpoint_dir is None and history_cfg is not None:
+            set_activation_scale_zeropoint(q_model, history_cfg)
+        else:
+            weights = torch.load(weights_file)
+            q_model.load_state_dict(weights)
         return q_model
 
     _propagate_qconfig(q_model, op_cfgs, white_list=white_list, approach=tune_cfg['approach'])
@@ -138,6 +180,9 @@ def load(checkpoint_dir, model, **kwargs):
     if tune_cfg['approach'] != "post_training_dynamic_quant":
         add_observer_(q_model)
     q_model = convert(q_model, mapping=q_mapping, inplace=True)
-    weights = torch.load(weights_file)
-    q_model.load_state_dict(weights)
+    if checkpoint_dir is None and history_cfg is not None:
+        set_activation_scale_zeropoint(q_model, history_cfg)
+    else:
+        weights = torch.load(weights_file)
+        q_model.load_state_dict(weights)
     return q_model

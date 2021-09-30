@@ -123,7 +123,7 @@ class TuneStrategy(object):
         path = Path(os.path.dirname(self.deploy_path))
         path.mkdir(exist_ok=True, parents=True)
 
-        logger.debug('Dump user yaml configuration:')
+        logger.debug("Dump user yaml configuration:")
         logger.debug(self.cfg)
 
         self.eval_dataloader = eval_dataloader
@@ -135,7 +135,7 @@ class TuneStrategy(object):
                                    'approach': self.cfg.quantization.approach,
                                    'random_seed': self.cfg.tuning.random_seed}
         framework = self.cfg.model.framework.lower()
-        if framework == 'tensorflow':
+        if framework == 'tensorflow' or framework == 'tensorflow_itex':
             framework_specific_info.update(
                 {"inputs": self.cfg.model.inputs,
                  "outputs": self.cfg.model.outputs,
@@ -151,6 +151,10 @@ class TuneStrategy(object):
             framework_specific_info.update({"q_dataloader": q_dataloader})
             framework_specific_info.update(
                 {"workspace_path": os.path.dirname(self.deploy_path)})
+            if self.cfg['quantization']['op_wise'] is not None \
+               and 'default_qconfig' in self.cfg['quantization']['op_wise']:
+                framework_specific_info.update(
+                    {"default_qconfig": self.cfg['quantization']['op_wise']['default_qconfig']})
         self.adaptor = FRAMEWORKS[framework](framework_specific_info)
         self.framework = framework
 
@@ -202,7 +206,7 @@ class TuneStrategy(object):
         self.combined_model_wise_quant_cfgs = conf._combine_optype_quant_cfgs(
                                          self.model_wise_quant_cfgs)
         if len(self.combined_model_wise_quant_cfgs) == 0:
-            logger.warning("There is no quantizable op type!!!")
+            logger.warning("No valid model wise quantization config found.")
 
         self.opwise_quant_cfgs = OrderedDict()
         for key in self.opwise_tune_cfgs:
@@ -227,12 +231,15 @@ class TuneStrategy(object):
         #   {
         #     'version': __version__,
         #     'cfg': cfg1,
+        #     'framework': tensorflow
         #     'baseline': baseline1,
         #     'last_tune_result': last_tune_result1,
         #     'best_tune_result': best_tune_result1,
         #     'history': [
         #                  # tuning history under same yaml config
-        #                  {'tune_cfg': tune_cfg1, 'tune_result': tune_result1, ...},
+        #                  {'tune_cfg': tune_cfg1, 'tune_result': \
+        #                               tune_result1, 'q_config': q_config1, ...},
+
         #                   ...,
         #                ],
         #     # new fields added by subclass for resuming
@@ -249,7 +256,7 @@ class TuneStrategy(object):
                 if self._same_yaml(history['cfg'], self.cfg):
                     self.__dict__.update({k: v for k, v in history.items() \
                                           if k not in ['version', 'history']})
-                    logger.info('Starting to resume tuning process...')
+                    logger.info("Start to resume tuning process.")
                     break
 
     def _same_yaml(self, src_yaml, dst_yaml):
@@ -280,52 +287,66 @@ class TuneStrategy(object):
         """The main traverse logic, which could be override by some concrete strategy which needs
            more hooks.
         """
-        # get fp32 model baseline
-        if self.baseline is None:
-            logger.info('Getting FP32 model baseline...')
-            self.baseline = self._evaluate(self.model)
-            # record the FP32 baseline
-            self._add_tuning_history()
-        baseline_msg = '[accuracy: {:.4f}, {}: {:.4f}]'.format(self.baseline[0],
-                                                                str(self.objective.measurer),
-                                                                self.baseline[1]) \
-                                                                if self.baseline else 'n/a'
-        logger.info('FP32 baseline is: {}'.format(baseline_msg))
-
-        trials_count = 0
-        for tune_cfg in self.next_tune_cfg():
-            # add tune_cfg here as quantize use tune_cfg
-            tune_cfg['advance'] = self.cfg.quantization.advance
-            trials_count += 1
-            tuning_history = self._find_tuning_history(tune_cfg)
-            if tuning_history and trials_count < self.cfg.tuning.exit_policy.max_trials:
-                self.last_tune_result = tuning_history['last_tune_result']
-                self.best_tune_result = tuning_history['best_tune_result']
-                logger.debug('This tuning config was evaluated, skip!')
-                continue
-
-            logger.debug('Dump current tuning configuration:')
-            logger.debug(tune_cfg)
-            self.q_model = self.adaptor.quantize(
-                tune_cfg, self.model, self.calib_dataloader, self.q_func)
-            self.algo.calib_iter = tune_cfg['calib_iteration']
-            self.algo.q_model = self.q_model
-            # TODO align the api to let strategy has access to pre_optimized model
-            assert self.adaptor.pre_optimized_model
-            self.algo.origin_model = self.adaptor.pre_optimized_model
-            self.last_qmodel = self.algo()
-            assert self.last_qmodel
-            self.last_tune_result = self._evaluate(self.last_qmodel)
-
-            need_stop = self.stop(self.cfg.tuning.exit_policy.timeout, trials_count)
-
-            # record the tuning history
-            saved_tune_cfg = copy.deepcopy(tune_cfg)
-            saved_last_tune_result = copy.deepcopy(self.last_tune_result)
-            self._add_tuning_history(saved_tune_cfg, saved_last_tune_result)
-
-            if need_stop:
+        if not (self.cfg.evaluation and self.cfg.evaluation.accuracy and \
+            self.cfg.evaluation.accuracy.metric) and self.eval_func is None:
+            logger.info("Neither evaluation function nor metric is defined." \
+                        " Generate quantized model with default quantization configuration.")
+            for tune_cfg in self.next_tune_cfg():
+                tune_cfg['advance'] = self.cfg.quantization.advance
+                logger.debug("Dump current tuning configuration:")
+                logger.debug(tune_cfg)
+                self.q_model = self.adaptor.quantize(
+                    tune_cfg, self.model, self.calib_dataloader, self.q_func)
                 break
+        else:
+            # get fp32 model baseline
+            if self.baseline is None:
+                logger.info("Get FP32 model baseline.")
+                self.baseline = self._evaluate(self.model)
+                # record the FP32 baseline
+                self._add_tuning_history()
+            baseline_msg = '[accuracy: {:.4f}, {}: {:.4f}]'.format(self.baseline[0],
+                                                                    str(self.objective.measurer),
+                                                                    self.baseline[1]) \
+                                                                    if self.baseline else 'n/a'
+            logger.info("FP32 baseline is: {}".format(baseline_msg))
+
+            trials_count = 0
+            for tune_cfg in self.next_tune_cfg():
+                # add tune_cfg here as quantize use tune_cfg
+                tune_cfg['advance'] = self.cfg.quantization.advance
+                trials_count += 1
+                tuning_history = self._find_tuning_history(tune_cfg)
+                if tuning_history and trials_count < self.cfg.tuning.exit_policy.max_trials:
+                    self.last_tune_result = tuning_history['last_tune_result']
+                    self.best_tune_result = tuning_history['best_tune_result']
+                    logger.warn("Find evaluated tuning config, skip.")
+                    continue
+
+                logger.debug("Dump current tuning configuration:")
+                logger.debug(tune_cfg)
+                self.q_model = self.adaptor.quantize(
+                    tune_cfg, self.model, self.calib_dataloader, self.q_func)
+                self.algo.calib_iter = tune_cfg['calib_iteration']
+                self.algo.q_model = self.q_model
+                # TODO align the api to let strategy has access to pre_optimized model
+                assert self.adaptor.pre_optimized_model
+                self.algo.origin_model = self.adaptor.pre_optimized_model
+                self.last_qmodel = self.algo()
+                assert self.last_qmodel
+                self.last_tune_result = self._evaluate(self.last_qmodel)
+
+                need_stop = self.stop(self.cfg.tuning.exit_policy.timeout, trials_count)
+
+                # record the tuning history
+                saved_tune_cfg = copy.deepcopy(tune_cfg)
+                saved_last_tune_result = copy.deepcopy(self.last_tune_result)
+                self._add_tuning_history(saved_tune_cfg,
+                                        saved_last_tune_result,
+                                        q_config=self.q_model.q_config)
+
+                if need_stop:
+                    break
 
     def deploy_config(self):
         acc_dataloader_cfg = deep_get(self.cfg, 'evaluation.accuracy.dataloader')
@@ -361,7 +382,7 @@ class TuneStrategy(object):
         setup_yaml()
         with open(self.deploy_path, 'w+') as f:
             yaml.dump(self.deploy_cfg, f)
-            logger.info('Save deploy yaml to path {}'.format(self.deploy_path))
+            logger.info("Save deploy yaml to {}".format(self.deploy_path))
 
     def _get_common_cfg(self, model_wise_cfg, op_wise_cfgs):
         """Get the common parts from the model_wise_cfg.
@@ -408,7 +429,8 @@ class TuneStrategy(object):
                 # post_eval_hook to deal the tensor
                 self.adaptor._post_eval_hook(model, accuracy=val[0])
         else:
-            assert self.cfg.evaluation.accuracy.metric is not None, \
+            assert self.cfg.evaluation and self.cfg.evaluation.accuracy and \
+                self.cfg.evaluation.accuracy.metric, \
                 'metric field of accuracy field of evaluation section should not be empty'
 
             postprocess_cfg = self.cfg.evaluation.accuracy.postprocess
@@ -458,15 +480,15 @@ class TuneStrategy(object):
         else:
             del self.last_qmodel
 
-        last_tune_msg = '[accuracy: {:.4f}, {}: {:.4f}]'.format(self.last_tune_result[0], 
+        last_tune_msg = '[accuracy: {:.4f}, {}: {:.4f}]'.format(self.last_tune_result[0],
                                                                 str(self.objective.measurer),
                                                                 self.last_tune_result[1]) \
                                                                 if self.last_tune_result else 'n/a'
-        best_tune_msg = '[accuracy: {:.4f}, {}: {:.4f}]'.format(self.best_tune_result[0], 
+        best_tune_msg = '[accuracy: {:.4f}, {}: {:.4f}]'.format(self.best_tune_result[0],
                                                                 str(self.objective.measurer),
                                                                 self.best_tune_result[1]) \
                                                                 if self.best_tune_result else 'n/a'
-        logger.info('Tune {} result is: {}, Best tune result is: {}'.format(trials_count,
+        logger.info("Tune {} result is: {}, Best tune result is: {}".format(trials_count,
                                                                             last_tune_msg,
                                                                             best_tune_msg))
 
@@ -486,7 +508,7 @@ class TuneStrategy(object):
 
         """
 
-        logger.info('Save tuning history to ' + self.history_path)
+        logger.info("Save tuning history to {}.".format(self.history_path))
         with fault_tolerant_file(self.history_path) as f:
             pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
 

@@ -40,7 +40,7 @@ def find_by_name(item_name, item_list):
 
 class ONNXModel(BaseModel):
     def __init__(self, model, **kwargs):
-        self._model = model
+        self._model = model if not isinstance(model, str) else onnx.load(model)
         self.node_name_counter = {}
         self._graph_info = {}
         self._get_graph_info()
@@ -48,9 +48,18 @@ class ONNXModel(BaseModel):
         self._get_input_name_to_nodes()
         self._output_name_to_node = {}
         self._get_output_name_to_node()
+        self._q_config = None
 
     def framework(self):
         return 'onnxruntime'
+
+    @property
+    def q_config(self):
+        return self._q_config
+
+    @q_config.setter
+    def q_config(self, q_config):
+        self._q_config = q_config
 
     @property
     def model(self):
@@ -210,10 +219,10 @@ class ONNXModel(BaseModel):
                     nodes.append(node)
         return nodes
 
-    def get_scale_zo(self, tensor):
+    def get_scale_zero(self, tensor):
         ''' help function to get scale and zero_point '''
         if not tensor.endswith('_quantized'):
-            logger.debug('tensor {} in the quantized graph is not quantized'.format(tensor))
+            logger.debug("Find {} in the quantized graph is not quantized.".format(tensor))
             return None, None
         input_name_to_nodes = self._input_name_to_nodes
         node = input_name_to_nodes[tensor][0]

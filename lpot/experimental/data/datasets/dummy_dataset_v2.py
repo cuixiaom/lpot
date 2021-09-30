@@ -19,13 +19,14 @@ import sys
 from .dataset import dataset_registry, IterableDataset
 import numpy as np
 from lpot.utils.utility import LazyImport
-from lpot.utils import logger
 
 mx = LazyImport('mxnet')
 torch = LazyImport('torch')
 
-@dataset_registry(dataset_type="dummy_v2", framework="tensorflow, onnxrt_qlinearops, \
-                  onnxrt_integerops, pytorch, pytorch_ipex, pytorch_fx, mxnet", dataset_format='')
+@dataset_registry(dataset_type="dummy_v2", framework="tensorflow, tensorflow_itex, \
+                                                      onnxrt_qlinearops, onnxrt_integerops, \
+                                                      pytorch, pytorch_ipex, pytorch_fx, mxnet",
+                                                      dataset_format='')
 class DummyDataset(IterableDataset):
     """Dataset used for dummy_v2 data generation.
        This Dataset is to construct a dataset from a input shape and label shape.

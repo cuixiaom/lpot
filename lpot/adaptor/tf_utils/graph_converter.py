@@ -47,6 +47,7 @@ from .graph_rewriter.generic.fold_batch_norm import FoldBatchNormNodesOptimizer
 from .graph_rewriter.generic.fuse_pad_with_conv import FusePadWithConv2DOptimizer
 
 from .graph_rewriter.int8.freeze_value import FreezeValueTransformer
+from .graph_rewriter.int8.freeze_value_without_calib import FreezeValueWithoutCalibTransformer
 from .graph_rewriter.int8.freeze_fake_quant import FreezeFakeQuantOpOptimizer
 from .graph_rewriter.int8.fuse_conv_requantize import FuseConvRequantizeTransformer
 from .graph_rewriter.int8.fuse_matmul_requantize import FuseMatMulRequantizeTransformer
@@ -56,12 +57,16 @@ from .graph_rewriter.bf16.bf16_convert import BF16Convert
 from .graph_rewriter.int8.post_quantized_op_cse import PostCseOptimizer
 from .graph_rewriter.int8.meta_op_optimizer import MetaInfoChangingMemOpOptimizer
 from .graph_rewriter.int8.rnn_convert import QuantizedRNNConverter
+from .graph_rewriter.itex.itex_convert import GenerateITEXModel
 from lpot.adaptor.tf_utils.graph_rewriter.generic.insert_print_node import InsertPrintMinMaxNode
 from lpot.adaptor.tf_utils.graph_rewriter.graph_util import GraphRewriterHelper as Helper
 
 
 TF_SUPPORTED_MAX_VERSION = '2.6.0'
 TF_SUPPORTED_MIN_VERSION = '1.14.0'
+
+logger = logging.getLogger()
+debug = bool(logger.level == logging.DEBUG)
 
 class GraphConverter:
     def __init__(self,
@@ -72,7 +77,8 @@ class GraphConverter:
                  fp32_ops=[],
                  bf16_ops=[],
                  data_loader=None,
-                 fake_quant=False):
+                 fake_quant=False,
+                 itex_mode=False):
         """Convert graph.
 
         :param model: input tensorflow model.
@@ -82,9 +88,6 @@ class GraphConverter:
         :param data_loader: for calibration phase used dataloader
         :param fake_quant: for quantization-aware training model conversion to default model
         """
-        # Logger initial
-        self.logger = logging.getLogger()
-        self.debug = bool(self.logger.level == logging.DEBUG)
         self.model = model
         #(TODO) does it right to make the internal model format as graph_def
         self.output_tensor_names = self.model.output_tensor_names
@@ -99,6 +102,7 @@ class GraphConverter:
         self.bf16_ops = bf16_ops
         self.recipes = recipes
         self.fake_quant = fake_quant
+        self.itex_mode = itex_mode
         self.quantized_node_info = []
         self._calibration_data = []
         self._fp32_print_data = []
@@ -112,7 +116,12 @@ class GraphConverter:
         self._enable_kl_op_names = [
             k for k in self.op_wise_config if self.op_wise_config[k][1] == 'kl'
         ]
-
+        self.scale_info = {}
+        self.scale_info.update(qt_config)
+        self.scale_info.update({'recipes': self.recipes})
+        self.scale_info.update({'int8_sequences': self.int8_sequences})
+        self.scale_info.update({'bf16_ops': self.bf16_ops})
+        self.scale_info.update({'fp32_ops': self.fp32_ops})
 
         self._fp32_model = Model(self.model._model, **self.model.kwargs)
         self._fp32_model.graph_def = self.model.graph_def
@@ -123,6 +132,10 @@ class GraphConverter:
         self._sampling_model.output_tensor_names = self.output_tensor_names
         self._sampling_model.input_tensor_names = self.input_tensor_names
 
+        self._itex_model = Model(self.model._model, **self.model.kwargs)
+        self._itex_model.graph_def = self.model.graph_def
+        self._itex_model.output_tensor_names = self.output_tensor_names
+        self._itex_model.input_tensor_names = self.input_tensor_names
         self._tmp_graph_def = copy.deepcopy(self.model.graph_def)
     # pylint: disable=no-member
     def _inference(self, model):
@@ -133,8 +146,8 @@ class GraphConverter:
         """
         input_tensor = model.input_tensor
         output_tensor = model.output_tensor
-        
-        self.logger.info("Sampling data...")
+
+        logger.info("Start sampling on calibration dataset.")
         for idx, (inputs, labels) in enumerate(self.data_loader):
             if len(input_tensor) == 1:
                 feed_dict = {input_tensor[0]: inputs}  # get raw tensor using index [0]
@@ -170,27 +183,27 @@ class GraphConverter:
             raise ValueError(e)
         finally:
             if tf.version.VERSION > TF_SUPPORTED_MAX_VERSION:
-                self.logger.warning(
-                    str('Please note the {} version of Intel® Optimizations for'
-                        ' TensorFlow is not fully verified!'
-                        ' Suggest to use the versions'
-                        ' between {} and {} if meet problem').format(tf.version.VERSION,
+                logger.warning(
+                    str('Please note the {} version of Intel® Optimizations for '
+                        'TensorFlow is not fully verified! '
+                        'Suggest to use the versions '
+                        'between {} and {} if meet problem.').format(tf.version.VERSION,
                                                                      TF_SUPPORTED_MIN_VERSION,
                                                                      TF_SUPPORTED_MAX_VERSION))
             if tf.version.VERSION == '2.5.0' and os.getenv('TF_ENABLE_MKL_NATIVE_FORMAT') != '0':
-                self.logger.warning("Please set environment variable TF_ENABLE_MKL_NATIVE_FORMAT=0"
-                                    " when Tensorflow 2.5.0 installed.")
+                logger.fatal("Please set environment variable TF_ENABLE_MKL_NATIVE_FORMAT=0 "
+                             "when Tensorflow 2.5.0 installed.")
 
             if tf.version.VERSION == '2.6.0' and os.getenv('TF_ENABLE_ONEDNN_OPTS') != '1':
-                self.logger.warning("Please set environment variable TF_ENABLE_ONEDNN_OPTS=1"
-                                    " when Tensorflow 2.6.0 installed.")
+                logger.fatal("Please set environment variable TF_ENABLE_ONEDNN_OPTS=1 "
+                             "when Tensorflow 2.6.0 installed.")
 
             if not is_supported_version:
                 raise ValueError(
-                    str('Please install Intel® Optimizations for TensorFlow'
-                        ' or MKL enabled source build TensorFlow'
-                        ' with version >={} and <={}').format(TF_SUPPORTED_MIN_VERSION,
-                                                              TF_SUPPORTED_MAX_VERSION))
+                    str('Please install Intel® Optimizations for TensorFlow '
+                        'or MKL enabled TensorFlow from source code '
+                        'within version >={} and <={}.').format(TF_SUPPORTED_MIN_VERSION,
+                                                                TF_SUPPORTED_MAX_VERSION))
 
     def _check_args(self):
         if self.model.workspace_path and not os.path.isdir(self.model.workspace_path) \
@@ -213,7 +226,6 @@ class GraphConverter:
         self._tmp_model = Model(self.model._model, **self.model.kwargs)
         self._tmp_model.output_tensor_names = self.output_tensor_names
         self._tmp_model.input_tensor_names = self.input_tensor_names
-    
 
     def convert(self):
         """Do convert, including:
@@ -229,16 +241,19 @@ class GraphConverter:
         if len(self.op_wise_config) > 0:
             model = self.quantize()
 
+        if self.itex_mode:
+            return self._itex_model
+
         if len(self.bf16_ops) > 0:
             model = self.bf16_convert()
         post_cse_graph_def = PostCseOptimizer(model.graph_def).do_transformation()
         post_cse_graph_def.library.CopyFrom(self.model.graph_def.library)
         model.graph_def = post_cse_graph_def
 
-        if self.debug:
+        if debug:
             model.save(self.output_graph)
-            self.logger.info('Converted graph file is saved to: %s', self.output_graph)
-
+            logger.info("Save converted graph file to {}.".format(self.output_graph))
+        model.q_config = self.scale_info
         return model
 
     def _get_fp32_print_node_names(self, specified_op_list):
@@ -484,6 +499,23 @@ class GraphConverter:
 
         return res
 
+    def _search_y_pattern_for_itex(self):
+        """Search the Y pattern for itex and return the op name.
+        """
+        g = GraphAnalyzer()
+        g.graph = self._fp32_model.graph_def
+        g.parse_graph()
+        y_pattern = [['Conv2D', 'MatMul'], ['BiasAdd'], ['Add'], ('Relu',)]
+        target_nodes = g.query_fusion_pattern_nodes(y_pattern)
+
+        res = {}
+        for i in target_nodes:
+            if i[2] not in res:
+                res[i[2]] = 1
+            else:
+                res[i[2]] += 1
+        return [(i,) for i in res if res[i] == 2]
+
     def quantize(self):
         """Quantize graph only (without optimizing fp32 graph), including:
             1) quantize graph,
@@ -509,6 +541,10 @@ class GraphConverter:
 
                 output_tensor_names = copy.deepcopy(self.model.output_tensor_names)
                 sampling_graph_def = copy.deepcopy(self._fp32_model.graph_def)
+
+                if self.itex_mode:
+                    self.quantized_node_info.extend(self._search_y_pattern_for_itex())
+
                 for i in self.quantized_node_info:
                     frame_name = self._rnn_details[i] if i in self._rnn_details else None
                     sampling_graph_def, output_names = InsertPrintMinMaxNode(
@@ -523,6 +559,14 @@ class GraphConverter:
                         self._inference(self._sampling_model)
                     self._calibration_data = Helper.gen_valid_sampling_log(tmp_dump_file)
 
+                if self.itex_mode:
+                    self._itex_model.graph_def = GenerateITEXModel(
+                        self._itex_model, self._calibration_data).do_transformation()
+                    self._itex_model.graph_def.library.CopyFrom(
+                        self.model.graph_def.library)
+
+                    return self._itex_model
+
                 if len(self._calibration_data) > 0:
                     self._freeze_requantization_ranges(self._kl_op_dict)
                     self._fuse_requantize_with_fused_quantized_node()
@@ -530,9 +574,9 @@ class GraphConverter:
             import traceback
             traceback.print_exc()
             self._tmp_model = None
-            self.logger.error('Failed to quantize graph due to: %s', str(e))
+            logger.error("Fail to quantize graph due to {}.".format(str(e)))
         finally:
-            if not self.debug:
+            if not debug:
                 self._post_clean()
             return self._tmp_model
 
@@ -548,9 +592,9 @@ class GraphConverter:
 
         except Exception as e:
             self._tmp_model = None
-            self.logger.error('Failed to convert graph due to: %s', str(e))
+            logger.error("Fail to convert graph due to {}.".format(str(e)))
         finally:
-            if self.debug:
+            if debug:
                 self._tmp_model.save(self._bf16_mixed_precision_model_path)
 
             return self._tmp_model
@@ -580,7 +624,7 @@ class GraphConverter:
             self.fake_quant).do_transform()
 
         self._tmp_graph_def.library.CopyFrom(self.model.graph_def.library)
-        if self.debug:
+        if debug:
             self._tmp_model.graph_def = self._tmp_graph_def
             self._tmp_model.save(self._int8_dynamic_range_model_path)
 
@@ -588,12 +632,12 @@ class GraphConverter:
 
         tmp_dump_file = os.path.join(os.path.dirname(self.output_graph), 'requant_min_max.log')
 
-        self.logger.debug("Generating calibration data and saving to {}".format(tmp_dump_file))
+        logger.debug("Generate calibration data and save to {}.".format(tmp_dump_file))
 
         model = Model(tmp_path, **self._tmp_model.kwargs)
         model.output_tensor_names = self.output_tensor_names
         model.input_tensor_names = self.input_tensor_names
-         
+
         with CaptureOutputToFile(tmp_dump_file):
             self._inference(model)
 
@@ -611,23 +655,25 @@ class GraphConverter:
                     self._kl_op_dict[key] = combine_histogram(self._kl_op_dict[key], fp32_data)
 
     def _freeze_requantization_ranges(self, additional_data=None):
-        self._tmp_graph_def = FreezeValueTransformer(
+        self._tmp_graph_def, quantizev2_max = FreezeValueTransformer(
             self._tmp_graph_def,
             self._calibration_data,
             '__max:').do_transformation()
-
-        self._tmp_graph_def = FreezeValueTransformer(
+        self._tmp_graph_def, quantizev2_min = FreezeValueTransformer(
             self._tmp_graph_def,
             self._calibration_data,
             '__min:').do_transformation()
-
-        self._tmp_graph_def = FreezeValueTransformer(
+        self._tmp_graph_def, requant_min_max= FreezeValueTransformer(
             self._tmp_graph_def,
             self._calibration_data,
             '__requant_min_max',
             tensor_data= additional_data,
             device=self.device,
             ).do_transformation()
+
+        self.scale_info.update(quantizev2_max)
+        self.scale_info.update(quantizev2_min)
+        self.scale_info.update(requant_min_max)
 
         self._tmp_graph_def = QuantizedRNNConverter(
             self._tmp_graph_def, self._calibration_data, self._rnn_details).do_transformation()
@@ -637,7 +683,7 @@ class GraphConverter:
             self._tmp_graph_def = ScaleProPagationTransformer(
                 self._tmp_graph_def).do_transformation()
 
-        if self.debug:
+        if debug:
             self._tmp_graph_def.library.CopyFrom(self.model.graph_def.library)
             self._tmp_model.graph_def = self._tmp_graph_def
             self._tmp_model.save(self._int8_frozen_range_model_path)
