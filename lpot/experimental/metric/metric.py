@@ -63,6 +63,7 @@ class ONNXRTITMetrics(object):
         self.metrics.update(ONNXRT_IT_METRICS)
 
 framework_metrics = {"tensorflow": TensorflowMetrics,
+                     "tensorflow_itex": TensorflowMetrics,
                      "mxnet": MXNetMetrics,
                      "pytorch": PyTorchMetrics,
                      "pytorch_ipex": PyTorchMetrics,
@@ -78,6 +79,7 @@ ONNXRT_QL_METRICS = {}
 ONNXRT_IT_METRICS = {}
 
 registry_metrics = {"tensorflow": TENSORFLOW_METRICS,
+                    "tensorflow_itex": TENSORFLOW_METRICS,
                     "mxnet": MXNET_METRICS,
                     "pytorch": PYTORCH_METRICS,
                     "pytorch_ipex": PYTORCH_METRICS,
@@ -88,7 +90,8 @@ registry_metrics = {"tensorflow": TENSORFLOW_METRICS,
 
 class METRICS(object):
     def __init__(self, framework):
-        assert framework in ("tensorflow", "pytorch", "pytorch_ipex", "pytorch_fx", \
+        assert framework in ("tensorflow", "tensorflow_itex",
+                            "pytorch", "pytorch_ipex", "pytorch_fx", \
                              "onnxrt_qlinearops", "onnxrt_integerops", "mxnet"), \
                              "framework support tensorflow pytorch mxnet onnxrt"
         self.metrics = framework_metrics[framework]().metrics
@@ -118,6 +121,7 @@ def metric_registry(metric_type, framework):
         for single_framework in [fwk.strip() for fwk in framework.split(',')]:
             assert single_framework in [
                 "tensorflow",
+                "tensorflow_itex",
                 "mxnet",
                 "onnxrt_qlinearops",
                 "onnxrt_integerops",
@@ -544,7 +548,7 @@ class TensorflowTopK(BaseMetric):
     def result(self):
         """calculate metric"""
         if self.num_sample == 0:
-            logger.warning("sample num is 0 can't calculate topk")
+            logger.warning("Sample num during evaluation is 0.")
             return 0
         else:
             return self.num_correct / self.num_sample
@@ -587,7 +591,7 @@ class GeneralTopK(BaseMetric):
     def result(self):
         """calculate metric"""
         if self.num_sample == 0:
-            logger.warning("sample num is 0 can't calculate topk")
+            logger.warning("Sample num during evaluation is 0.")
             return 0
         else:
             return self.num_correct / self.num_sample
@@ -705,7 +709,7 @@ class TensorflowMAP(BaseMetric):
         """calculate metric"""
         from .coco_tools import COCOWrapper, COCOEvalWrapper
         if len(self.ground_truth_list) == 0:
-            logger.warning("sample num is 0 can't calculate mAP")
+            logger.warning("Sample num during evaluation is 0.")
             return 0
         else:
             groundtruth_dict = {

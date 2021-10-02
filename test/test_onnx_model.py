@@ -1,4 +1,5 @@
 import sys
+import os
 import onnx
 from onnx import helper, TensorProto, numpy_helper
 import unittest
@@ -20,6 +21,40 @@ def generate_input_initializer(tensor_shape, tensor_dtype, input_name):
     init = numpy_helper.from_array(tensor, input_name)
     return init  
 
+class TestOnnxModelUtil(unittest.TestCase):
+    def setUp(self):
+        #   input
+        #    |
+        #   Mul
+        #    |  \
+        #    |    initializer
+        #    |  /
+        #   Mul
+        input0 = helper.make_tensor_value_info('input0', TensorProto.FLOAT, [1, 3])
+        output = helper.make_tensor_value_info('output', TensorProto.FLOAT, [1, 3])
+        
+        mul_weight = generate_input_initializer([], np.float32, 'mul_weight')
+       
+        mul_node_1 = onnx.helper.make_node('Mul', ['input0', 'mul_weight'], ['mul_1'], name='Mul1')
+        mul_node_2 = onnx.helper.make_node('Mul', ['mul_1', 'mul_weight'], ['output'], name= 'Mul2')
+        
+        graph = helper.make_graph([mul_node_1, mul_node_2], 'test_graph', [input0], [output])
+        graph.initializer.add().CopyFrom(mul_weight)
+
+        model = helper.make_model(graph)
+        test_model_path = './test_model.onnx'
+        onnx.save(model, test_model_path)
+        model = onnx.load(test_model_path)
+        self.model = ONNXModel(model)
+
+    def test_split_shared_input(self):
+        from lpot.adaptor.ox_utils.util import split_shared_input
+        model = split_shared_input(self.model)
+        self.assertIsNone(model.get_initializer('mul_weight_lpot_split_Mul1'))
+        self.assertIsNotNone(model.get_initializer('mul_weight_lpot_split_Mul2'))
+
+    def tearDown(self):
+        os.remove('./test_model.onnx')
 
 class TestOnnxModel(unittest.TestCase):
     def setUp(self):
@@ -73,29 +108,29 @@ class TestOnnxModel(unittest.TestCase):
         A = helper.make_tensor_value_info('A', TensorProto.FLOAT, [1, 1, 5, 5])
         A_scale = helper.make_tensor_value_info('A_scale', TensorProto.FLOAT, [1])
         a_scale = generate_input_initializer([1], np.float32, 'A_scale')
-        A_zo = helper.make_tensor_value_info('A_zero_point', TensorProto.INT8, [1])
+        A_zero = helper.make_tensor_value_info('A_zero_point', TensorProto.INT8, [1])
         a_zero_point = generate_input_initializer([1], np.int8, 'A_zero_point')
         B_scale = helper.make_tensor_value_info('B_scale', TensorProto.FLOAT, [1])
         b_scale = generate_input_initializer([1], np.float32, 'B_scale')
-        B_zo = helper.make_tensor_value_info('B_zero_point', TensorProto.INT8, [1])
+        B_zero = helper.make_tensor_value_info('B_zero_point', TensorProto.INT8, [1])
         b_zero_point = generate_input_initializer([1], np.int8, 'B_zero_point')
         C = helper.make_tensor_value_info('C', TensorProto.INT8, [1, 1, 5, 5])
         c = generate_input_initializer([1, 1, 5, 5], np.int8, 'C')
         C_scale = helper.make_tensor_value_info('C_scale', TensorProto.FLOAT, [1])
         c_scale = generate_input_initializer([1], np.float32, 'C_scale')
-        C_zo = helper.make_tensor_value_info('C_zero_point', TensorProto.INT8, [1])
+        C_zero = helper.make_tensor_value_info('C_zero_point', TensorProto.INT8, [1])
         c_zero_point = generate_input_initializer([1], np.int8, 'C_zero_point')
         E = helper.make_tensor_value_info('E', TensorProto.INT32, [1])
         e = generate_input_initializer([1], np.int32, 'E')
         D_scale = helper.make_tensor_value_info('D_scale', TensorProto.FLOAT, [1])
         d_scale = generate_input_initializer([1], np.float32, 'D_scale')
-        D_zo = helper.make_tensor_value_info('D_zero_point', TensorProto.INT8, [1])
+        D_zero = helper.make_tensor_value_info('D_zero_point', TensorProto.INT8, [1])
         d_zero_point = generate_input_initializer([1], np.int8, 'D_zero_point')
         D = helper.make_tensor_value_info('D', TensorProto.FLOAT, [1, 1, 5, 5])
         quantize_node = onnx.helper.make_node('QuantizeLinear', ['A', 'A_scale', 'A_zero_point'], ['B_quantized'], name='A_QuantizeLinear')
         conv_node = onnx.helper.make_node('QLinearConv', ['B_quantized', 'B_scale', 'B_zero_point', 'C_quantized', 'C_scale', 'C_zero_point', 'D_scale', 'D_zero_point', 'E'], ['D_quantized'], name='conv_quant', kernel_shape=[3, 3], pads=[1, 1, 1, 1])
         dequantize_node = onnx.helper.make_node('DequantizeLinear', ['D_quantized', 'D_scale', 'D_zero_point'], ['D'], name='D_DequantizeLinear')
-        graph = helper.make_graph([quantize_node, conv_node, dequantize_node], 'test_graph_7', [A, A_scale, A_zo, C, C_scale, C_zo, E, D_scale, D_zo], [D])
+        graph = helper.make_graph([quantize_node, conv_node, dequantize_node], 'test_graph_7', [A, A_scale, A_zero, C, C_scale, C_zero, E, D_scale, D_zero], [D])
         graph.initializer.add().CopyFrom(a_scale)
         graph.initializer.add().CopyFrom(a_zero_point)
         graph.initializer.add().CopyFrom(b_scale)
@@ -243,10 +278,10 @@ class TestOnnxModel(unittest.TestCase):
         self.assertEqual(len(nodes), 1)
         self.assertEqual(nodes[0].name, "Conv1")
 
-    def test_get_scale_zo(self):
-        input_scale, input_zo = self.q_model.get_scale_zo('B_quantized')
-        weight_scale, weight_zo = self.q_model.get_scale_zo('C_quantized') 
-        bias_scale, bias_zo = self.q_model.get_scale_zo('E')
+    def test_get_scale_zero(self):
+        input_scale, input_zero = self.q_model.get_scale_zero('B_quantized')
+        weight_scale, weight_zero = self.q_model.get_scale_zero('C_quantized') 
+        bias_scale, bias_zero = self.q_model.get_scale_zero('E')
 
     def test_save(self):
         self.model.save_model_to_file('./test_model_6.onnx', use_external_data_format=True)

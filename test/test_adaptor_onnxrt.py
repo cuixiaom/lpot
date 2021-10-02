@@ -7,7 +7,7 @@ import torchvision
 import yaml
 import onnx
 import numpy as np
-
+from collections import OrderedDict
 from onnx import onnx_pb as onnx_proto
 from onnx import helper, TensorProto, numpy_helper
 from lpot.adaptor import FRAMEWORKS
@@ -43,6 +43,8 @@ def build_static_yaml():
           exit_policy:
             timeout: 0
           random_seed: 9527
+          workspace: 
+            path: ./lpot_workspace/recover/
         """
     with open("static.yaml", "w", encoding="utf-8") as f:
         f.write(fake_yaml)
@@ -103,6 +105,32 @@ def build_dynamic_yaml():
         """
     with open("dynamic.yaml", "w", encoding="utf-8") as f:
         f.write(fake_yaml)
+
+def build_gather_yaml():
+    fake_yaml = """
+        model:
+          name: imagenet
+          framework: onnxrt_qlinearops
+
+        quantization:                                        
+          approach: post_training_static_quant 
+          calibration:
+              sampling_size: 1
+        evaluation:
+          accuracy:
+            metric:
+              Accuracy: {}
+
+        tuning:
+          accuracy_criterion:
+            relative:  -0.01
+          exit_policy:
+            timeout: 0
+          random_seed: 9527
+        """
+    with open("gather.yaml", "w", encoding="utf-8") as f:
+        f.write(fake_yaml)
+
 
 def build_non_MSE_yaml():
     fake_yaml = """
@@ -166,15 +194,15 @@ def export_onnx_model(model, path):
                     dynamic_axes={"input" : {0 : "batch_size"},    # variable length axes
                                   "output" : {0 : "batch_size"}})
 
-def build_ir3_model():
-    def generate_input_initializer(tensor_shape, tensor_dtype, input_name):
-        '''
-        Helper function to generate initializers for test inputs
-        '''
-        tensor = np.random.ranf(tensor_shape).astype(tensor_dtype)
-        init = numpy_helper.from_array(tensor, input_name)
-        return init  
+def generate_input_initializer(tensor_shape, tensor_dtype, input_name):
+    '''
+    Helper function to generate initializers for test inputs
+    '''
+    tensor = np.random.ranf(tensor_shape).astype(tensor_dtype)
+    init = numpy_helper.from_array(tensor, input_name)
+    return init  
 
+def build_ir3_model():
     input0 = helper.make_tensor_value_info('input0', TensorProto.FLOAT, [1, 2048])
     output = helper.make_tensor_value_info('output', TensorProto.FLOAT, [1, 1000])
     weight = helper.make_tensor_value_info('X1_weight', TensorProto.FLOAT, [1000, 2048])
@@ -193,6 +221,23 @@ def build_ir3_model():
     model.ir_version = 3
     return model
 
+def build_model_with_gather():
+    b_value = np.random.randint(2, size=(10)).astype(np.int32)
+    B_init = helper.make_tensor('B', TensorProto.INT32, [10], b_value.reshape(10).tolist())
+    A = helper.make_tensor_value_info('A', TensorProto.FLOAT, [1, 100, 4])
+    D = helper.make_tensor_value_info('D', TensorProto.FLOAT, [100, 4])
+    squeeze = onnx.helper.make_node('Squeeze', ['A'], ['D'], name='squeeze')
+    B = helper.make_tensor_value_info('B', TensorProto.INT32, [10])
+    C = helper.make_tensor_value_info('C', TensorProto.FLOAT, [10, 4])
+    node = onnx.helper.make_node('Gather', ['D', 'B'], ['C'], name='gather')
+    e_value = np.random.randint(2, size=(10)).astype(np.float32)
+    E_init = helper.make_tensor('E', TensorProto.FLOAT, [10, 1], e_value.reshape(10).tolist())
+    F = helper.make_tensor_value_info('F', TensorProto.FLOAT, [10, 4])
+    add = onnx.helper.make_node('Add', ['C', 'E'], ['F'], name='add')
+    graph = helper.make_graph([squeeze, node, add], 'test_graph_1', [A], [F], [B_init, E_init])
+    model = helper.make_model(graph, **{'opset_imports': [helper.make_opsetid('', 13)]})
+    return model
+
 class TestAdaptorONNXRT(unittest.TestCase):
 
     mb_v2_export_path = "mb_v2.onnx"
@@ -207,10 +252,14 @@ class TestAdaptorONNXRT(unittest.TestCase):
     ir3_dataset = datasets['dummy'](shape=(10, 2048), low=0., high=1., label=True)
     ir3_dataloader = DATALOADERS['onnxrt_qlinearops'](ir3_dataset)
 
+    gather_dataset = DATASETS('onnxrt_qlinearops')['dummy'](shape=(5, 100, 4), label=True)
+    gather_dataloader = DATALOADERS['onnxrt_qlinearops'](gather_dataset)
+
     @classmethod
     def setUpClass(self):
         build_static_yaml()
         build_dynamic_yaml()
+        build_gather_yaml()
         build_non_MSE_yaml()
         build_benchmark_yaml()
         export_onnx_model(self.mb_v2_model, self.mb_v2_export_path)
@@ -218,6 +267,7 @@ class TestAdaptorONNXRT(unittest.TestCase):
         export_onnx_model(self.rn50_model, self.rn50_export_path)
         self.rn50_model = onnx.load(self.rn50_export_path)
         self.ir3_model = build_ir3_model()
+        self.gather_model = build_model_with_gather()
 
     @classmethod
     def tearDownClass(self):
@@ -225,8 +275,10 @@ class TestAdaptorONNXRT(unittest.TestCase):
         os.remove("dynamic.yaml")
         os.remove("non_MSE.yaml")
         os.remove("benchmark.yaml")
+        os.remove("gather.yaml")
         os.remove(self.mb_v2_export_path)
         os.remove(self.rn50_export_path)
+        os.remove("best_model.onnx")
         shutil.rmtree("./saved", ignore_errors=True)
         shutil.rmtree("runs", ignore_errors=True)
 
@@ -246,6 +298,9 @@ class TestAdaptorONNXRT(unittest.TestCase):
         adaptor.inspect_tensor(self.rn50_model, self.cv_dataloader, inspect_type='weight')
         adaptor.inspect_tensor(self.rn50_model, self.cv_dataloader, inspect_type='all')
         adaptor.inspect_tensor(self.rn50_model, self.cv_dataloader, ["Conv_0"], inspect_type='activation')
+        op_list = OrderedDict()
+        op_list[("Conv_0", "Conv")] = None
+        adaptor.inspect_tensor(self.rn50_model, self.cv_dataloader, op_list.keys(), inspect_type='activation')
 
     def test_set_tensor(self):
         quantizer = Quantization("static.yaml")
@@ -264,16 +319,19 @@ class TestAdaptorONNXRT(unittest.TestCase):
         framework = "onnxrt_qlinearops"
         adaptor = FRAMEWORKS[framework](framework_specific_info) 
         q_config = {'fused Conv_0': {'weight': {'granularity': 'per_channel', 'dtype': onnx_proto.TensorProto.INT8}}}
-        adaptor.q_config = q_config
+        adaptor.quantize_config = q_config
         version = get_torch_version()
+        q_model.save('./best_model.onnx')
         if version >= '1.7':
-            adaptor.set_tensor(q_model, 
+            adaptor.set_tensor(onnx.load("best_model.onnx"), 
                 {self.mb_v2_model.graph.node[0].input[1]: np.random.random([32, 3, 3, 3])})
             adaptor.set_tensor(q_model,
                 {self.mb_v2_model.graph.node[0].input[2]: np.random.random([32])})
         else:
-            adaptor.set_tensor(q_model, {'ConvBnFusion_W_features.0.0.weight': np.random.random([32, 3, 3, 3])})
+            adaptor.set_tensor(onnx.load("best_model.onnx"), 
+                {'ConvBnFusion_W_features.0.0.weight': np.random.random([32, 3, 3, 3])})
             adaptor.set_tensor(q_model, {'ConvBnFusion_BN_B_features.0.1.bias': np.random.random([32])})
+
 
     def test_adaptor(self):
         for fake_yaml in ["static.yaml", "dynamic.yaml"]:
@@ -283,6 +341,32 @@ class TestAdaptorONNXRT(unittest.TestCase):
             quantizer.model = common.Model(self.rn50_model)
             q_model = quantizer()
             eval_func(q_model)
+
+        framework_specific_info = {"device": "cpu",
+                     "approach": "post_training_static_quant",
+                     "random_seed": 1234,
+                     "q_dataloader": None,
+                     "backend": "qlinearops",
+                     "workspace_path": './lpot_workspace/{}/{}/'.format(
+                                             'onnxrt',
+                                             'imagenet')}
+        framework = "onnxrt_qlinearops"
+        adaptor = FRAMEWORKS[framework](framework_specific_info) 
+        tune_cfg = {'calib_iteration': 1,
+                    'op': {('gather', 'Gather'): {'activation':  {'dtype': ['uint8']},
+                                                 'weight': {'dtype': ['uint8']}},
+                           ('add', 'Add'): {'activation':  {'dtype': ['uint8']},
+                                           'weight': {'dtype': ['int8']}}}}
+        adaptor.quantize(tune_cfg, common.Model(self.gather_model), self.gather_dataloader)
+        self.assertTrue(len(adaptor.quantizable_ops), 2)
+ 
+        for fake_yaml in ["gather.yaml"]:
+            quantizer = Quantization(fake_yaml)
+            quantizer.calib_dataloader = self.gather_dataloader
+            quantizer.eval_dataloader = self.gather_dataloader
+            quantizer.model = common.Model(self.gather_model)
+            q_model = quantizer()
+ 
         for fake_yaml in ["non_MSE.yaml"]:
             quantizer = Quantization(fake_yaml)
             quantizer.calib_dataloader = self.cv_dataloader
@@ -297,6 +381,10 @@ class TestAdaptorONNXRT(unittest.TestCase):
             quantizer.eval_dataloader = self.ir3_dataloader
             quantizer.model = common.Model(self.ir3_model)
             q_model = quantizer()
+
+            from lpot.utils.utility import recover
+            model = recover(self.ir3_model, './lpot_workspace/recover/history.snapshot', 0)
+            self.assertTrue(model.model == q_model.model)
 
         for mode in ["performance", "accuracy"]:
             fake_yaml = "benchmark.yaml"

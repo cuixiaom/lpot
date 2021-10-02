@@ -23,15 +23,16 @@ from dataclasses import dataclass
 from typing import List, Optional, Union
 from lpot.utils.utility import LazyImport
 from .dataset import dataset_registry, Dataset
-torch = LazyImport('torch')                      
+torch = LazyImport('torch')
 transformers = LazyImport('transformers')
 
+logger = logging.getLogger()
 
 @dataset_registry(dataset_type="bert", framework="pytorch", dataset_format='')
 class PytorchBertDataset(Dataset):
     """Dataset used for model Bert.
        This Dataset is to construct from the Bert TensorDataset and not a full implementation
-       from yaml cofig. The original repo link is: https://github.com/huggingface/transformers.
+       from yaml config. The original repo link is: https://github.com/huggingface/transformers.
        When you want use this Dataset, you should add it before you initialize your DataLoader.
        (TODO) add end to end support for easy config by yaml by adding the method of
        load examples and process method.
@@ -41,7 +42,7 @@ class PytorchBertDataset(Dataset):
           model_type (str, default='bert'): model type, support 'distilbert', 'bert',
                                             'xlnet', 'xlm'.
           transform (transform object, default=None):  transform to process input data.
-          filter (Filter objects, default=None): filter out examples according 
+          filter (Filter objects, default=None): filter out examples according
                                                  to specific conditions.
     """
 
@@ -68,7 +69,7 @@ class PytorchBertDataset(Dataset):
             if self.model_type != 'distilbert':
                 # XLM, DistilBERT and RoBERTa don't use segment_ids
                 if self.model_type in ['bert', 'xlnet']:
-                    inputs['token_type_ids'] = sample[2] 
+                    inputs['token_type_ids'] = sample[2]
             sample = (inputs, inputs['labels'])
 
         elif self.task == 'squad':
@@ -93,19 +94,19 @@ class ONNXRTBertDataset(Dataset):
     Args: data_dir (str): The input data dir.
           model_name_or_path (str): Path to pre-trained student model or shortcut name,
                                     selected in the list:
-          max_seq_length (int, default=128): The maximum length after tokenization. 
-                                Sequences longer than this will be truncated, 
+          max_seq_length (int, default=128): The maximum length after tokenization.
+                                Sequences longer than this will be truncated,
                                 sequences shorter will be padded.
           do_lower_case (bool, default=True): Whether to lowercase the input when tokenizing.
-          task (str, default=mrpc): The name of the task to fine-tune. 
+          task (str, default=mrpc): The name of the task to fine-tune.
                                     Choices include mrpc, qqp, qnli, rte,
                                     sts-b, cola, mnli, wnli.
           model_type (str, default='bert'): model type, support 'distilbert', 'bert',
                                             'mobilebert', 'roberta'.
           dynamic_length (bool, default=False): Whether to use fixed sequence length.
-          evaluate (bool, defaulr=True): Whether do evaluation or training.                                  
+          evaluate (bool, default=True): Whether do evaluation or training.
           transform (transform object, default=None):  transform to process input data.
-          filter (Filter objects, default=None): filter out examples according 
+          filter (Filter objects, default=None): filter out examples according
                                                  to specific conditions.
     """
     def __init__(self, data_dir, model_name_or_path, max_seq_length=128,\
@@ -114,9 +115,9 @@ class ONNXRTBertDataset(Dataset):
         task = task.lower()
         model_type = model_type.lower()
         assert task in ['mrpc', 'qqp', 'qnli', 'rte', 'sts-b', 'cola', \
-            'mnli', 'wnli'], 'Unsupported task type'   
+            'mnli', 'wnli'], 'Unsupported task type'
         assert model_type in ['distilbert', 'bert', 'mobilebert', 'roberta'], 'Unsupported \
-            model type'         
+            model type'
         self.dynamic_length = dynamic_length
         self.model_type = model_type
         self.max_seq_length = max_seq_length
@@ -135,7 +136,6 @@ def load_and_cache_examples(data_dir, model_name_or_path, max_seq_length, task, 
     model_type, tokenizer, evaluate):
     from torch.utils.data import TensorDataset
 
-    logger = logging.getLogger()
     processor = transformers.glue_processors[task]()
     output_mode = transformers.glue_output_modes[task]
     # Load data features from cache or dataset file
@@ -147,10 +147,10 @@ def load_and_cache_examples(data_dir, model_name_or_path, max_seq_length, task, 
         str(max_seq_length),
         str(task)))
     if os.path.exists(cached_features_file):
-        logger.info("Loading features from cached file %s", cached_features_file)
+        logger.info("Load features from cached file {}.".format(cached_features_file))
         features = torch.load(cached_features_file)
     else:
-        logger.info("Creating features from dataset file at %s", data_dir)
+        logger.info("Create features from dataset file at {}.".format(data_dir))
         label_list = processor.get_labels()
         if task in ['mnli', 'mnli-mm'] and model_type in ['roberta']:
             # HACK(label indices are swapped in RoBERTa pretrained model)
@@ -164,7 +164,7 @@ def load_and_cache_examples(data_dir, model_name_or_path, max_seq_length, task, 
                                                 max_length=max_seq_length,
                                                 output_mode=output_mode,
         )
-        logger.info("Saving features into cached file %s", cached_features_file)
+        logger.info("Save features into cached file {}.".format(cached_features_file))
         torch.save(features, cached_features_file)
     # Convert to Tensors and build dataset
     all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
@@ -190,11 +190,10 @@ def convert_examples_to_features(
     pad_token_segment_id=0,
     mask_padding_with_zero=True,
 ):
-    logger = logging.getLogger()
     processor = transformers.glue_processors[task]()
     if label_list is None:
         label_list = processor.get_labels()
-        logger.info("Using label list %s for task %s" % (label_list, task))
+        logger.info("Use label list {} for task {}.".format(label_list, task))
     label_map = {label: i for i, label in enumerate(label_list)}
     features = []
     for (ex_index, example) in enumerate(examples):
@@ -251,7 +250,7 @@ def convert_examples_to_features(
 @dataclass(frozen=True)
 class InputFeatures:
     """
-    A single set of features of data. 
+    A single set of features of data.
     Property names are the same names as the corresponding inputs to a model.
     Args:
         input_ids: Indices of input sequence tokens in the vocabulary.
@@ -286,10 +285,10 @@ class TensorflowBertDataset(Dataset):
           task (str, default='squad'): task type of model.
           model_type (str, default='bert'): model type, support 'bert'.
           transform (transform object, default=None):  transform to process input data.
-          filter (Filter objects, default=None): filter out examples according 
+          filter (Filter objects, default=None): filter out examples according
                                                  to specific conditions
     """
-    def __init__(self, root, label_file, task='squad', 
+    def __init__(self, root, label_file, task='squad',
             model_type='bert', transform=None, filter=None):
         import json
         with open(label_file) as lf:
@@ -305,4 +304,3 @@ class TensorflowBertDataset(Dataset):
 
     def __len__(self):
         return 1
-

@@ -17,6 +17,11 @@ https://storage.googleapis.com/intel-optimized-tensorflow/intel_tensorflow-1.15.
 https://storage.googleapis.com/intel-optimized-tensorflow/intel_tensorflow-1.15.0up2-cp37-cp37m-manylinux2010_x86_64.whl
 https://storage.googleapis.com/intel-optimized-tensorflow/intel_tensorflow-1.15.0up2-cp35-cp35m-manylinux2010_x86_64.whl
 
+Intel Tensorflow 2.5.0 also supports since LPOT 1.6 release.
+```python
+pip install intel-tensorflow==2.5.0
+```
+
 ### 3. Prepare Dataset
 ```shell
 wget https://storage.googleapis.com/bert_models/2019_05_30/wwm_uncased_L-24_H-1024_A-16.zip
@@ -67,6 +72,8 @@ bash prepare_model.sh --output_dir=./model
   python freeze_estimator_to_pb.py --input_model=./model --output_model=./bert_fp32.pb
   ```
 ## Run Command
+  <b><font color='red'>Please make sure below command should be executed with the same Tensorflow runtime version as above step.</font></b>
+
   ```shell
   python tune_squad.py --config=./bert.yaml --input_model=./bert_fp32.pb --output_model=./int8.pb --tune
   ```
