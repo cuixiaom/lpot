@@ -32,9 +32,9 @@ function quantize_transformer_mlperf() {
 
 cd ./examples/tensorflow/nlp/transformer_lt
 
-quantize_transformer_lt
+#quantize_transformer_lt
 
-#quantize_transformer_mlperf
+quantize_transformer_mlperf
 
 cd -
 
